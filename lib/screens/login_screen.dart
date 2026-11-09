@@ -1,7 +1,14 @@
 
 import 'package:flutter/material.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
 import '../services/api_service.dart';
+
+import 'register_screen.dart';
+import 'dashboard_screen.dart';
+import 'supervisor_dashboard_screen.dart';
 
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
@@ -13,16 +20,11 @@ class LoginScreen extends StatefulWidget {
 class _LoginScreenState extends State<LoginScreen> {
   final _formKey = GlobalKey<FormState>();
 
-  final TextEditingController emailController =
-      TextEditingController();
+  final emailController = TextEditingController();
+  final passwordController = TextEditingController();
 
-  final TextEditingController passwordController =
-      TextEditingController();
-
-  bool isLoading = false;
   bool obscurePassword = true;
-
-  String selectedRole = 'asha_worker';
+  bool isLoading = false;
 
   @override
   void dispose() {
@@ -31,430 +33,384 @@ class _LoginScreenState extends State<LoginScreen> {
     super.dispose();
   }
 
-  // ============================================================
-  // LOGIN
-  // ============================================================
+  Future<void> loginAccount() async {
+    if (!_formKey.currentState!.validate()) return;
 
-  Future<void> login() async {
-    if (!_formKey.currentState!.validate()) {
-      return;
-    }
-
-    setState(() {
-      isLoading = true;
-    });
+    setState(() => isLoading = true);
 
     try {
-      final result = await ApiService.loginUser(
-        email: emailController.text.trim(),
-        password: passwordController.text,
-        role: selectedRole,
+      final email = emailController.text.trim().toLowerCase();
+      final password = passwordController.text;
+
+      // 1. Firebase Authentication.
+      final credential =
+          await FirebaseAuth.instance.signInWithEmailAndPassword(
+        email: email,
+        password: password,
       );
+
+      final user = credential.user;
+
+      if (user == null) {
+        throw Exception('Unable to login. Please try again.');
+      }
+
+      // 2. Get profile from Firestore.
+      final document = await FirebaseFirestore.instance
+          .collection('users')
+          .doc(user.uid)
+          .get();
+
+      if (!document.exists) {
+        await FirebaseAuth.instance.signOut();
+        throw Exception(
+          'User profile not found. Please contact the administrator.',
+        );
+      }
+
+      final data = document.data() ?? {};
+
+      final role = (data['role'] ?? 'ASHA Worker').toString();
+      final name = (data['name'] ?? user.displayName ?? '').toString();
+
+      // 3. Remove previous cloud session.
+      await ApiService.clearCloudSession();
+
+      // 4. Login with Render FastAPI backend.
+      final apiResult = await ApiService.loginUser(
+        email: email,
+        password: password,
+        role: role,
+      );
+
+      final cloudLoginSuccess =
+          apiResult['success'] == true &&
+          apiResult['offline'] != true;
+
+      // 5. Save local session details.
+      final prefs = await SharedPreferences.getInstance();
+
+      await prefs.setString('registered_email', email);
+      await prefs.setString('registered_role', role);
+      await prefs.setString('user_name', name);
+      await prefs.setString('firebase_uid', user.uid);
 
       if (!mounted) return;
 
-      print('LOGIN RESULT: $result');
+      // 6. Navigate according to role.
+      final isSupervisor =
+          role.trim().toLowerCase() == 'asha supervisor';
 
-      if (result['success'] != true) {
-        throw Exception(result['message']?.toString() ?? 'Login failed');
-      }
-
-      final prefs = await SharedPreferences.getInstance();
-      final responseData = result['data'];
-      final rawUser = responseData is Map && responseData['data'] is Map
-          ? responseData['data']
-          : responseData;
-      final user = rawUser is Map
-          ? Map<String, dynamic>.from(rawUser)
-          : <String, dynamic>{};
-      await prefs.setString('user_role', selectedRole);
-      await prefs.setString('user_name', user['name']?.toString() ?? 'User');
-      await prefs.setString('user_contact', user['email']?.toString() ?? user['mobile']?.toString() ?? emailController.text.trim());
-      final userId = int.tryParse(user['id']?.toString() ?? '');
-      if (userId != null) await prefs.setInt('user_id', userId);
-      await prefs.setString('user_village', user['village']?.toString() ?? '');
-      await prefs.setString('user_mobile', user['mobile']?.toString() ?? '');
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Login successful'),
-          backgroundColor: Colors.green,
-        ),
-      );
-
-      // --------------------------------------------------------
-      // CHANGE THESE ROUTES IF YOUR PROJECT USES DIFFERENT NAMES
-      // --------------------------------------------------------
-
-      if (selectedRole == 'supervisor') {
-        Navigator.pushReplacementNamed(
+      if (isSupervisor) {
+        Navigator.pushReplacement(
           context,
-          '/supervisor-dashboard',
-        );
-      } else if (selectedRole == 'asha_worker') {
-        Navigator.pushReplacementNamed(
-          context,
-          '/asha-dashboard',
-        );
-      } else if (selectedRole == 'beneficiary') {
-        Navigator.pushReplacementNamed(
-          context,
-          '/beneficiary-dashboard',
+          MaterialPageRoute(
+            builder: (_) => const SupervisorDashboardScreen(),
+          ),
         );
       } else {
-        Navigator.pushReplacementNamed(
+        Navigator.pushReplacement(
           context,
-          '/home',
+          MaterialPageRoute(
+            builder: (_) => const DashboardScreen(),
+          ),
         );
       }
-    } catch (e) {
+
+      // 7. Show actual cloud login status.
+      if (!cloudLoginSuccess) {
+        final String message;
+
+        if (apiResult['offline'] == true) {
+          message =
+              'Logged in offline. Cloud sync needs internet. '
+              '${apiResult['message'] ?? ''}';
+        } else {
+          final serverMessage =
+              apiResult['message']?.toString().trim() ?? '';
+
+          message = serverMessage.isNotEmpty
+              ? 'Firebase login successful, but cloud login failed: '
+                  '$serverMessage'
+              : 'Firebase login successful, but cloud login failed. '
+                  'Please check the server account.';
+        }
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(message),
+            backgroundColor: Colors.orange,
+            duration: const Duration(seconds: 8),
+          ),
+        );
+      }
+    } on FirebaseAuthException catch (e) {
       if (!mounted) return;
 
-      print('LOGIN ERROR: $e');
+      String message;
+
+      switch (e.code) {
+        case 'invalid-email':
+          message = 'Please enter a valid email address.';
+          break;
+
+        case 'user-not-found':
+        case 'invalid-credential':
+        case 'wrong-password':
+          message = 'Incorrect email or password.';
+          break;
+
+        case 'user-disabled':
+          message = 'This account has been disabled.';
+          break;
+
+        case 'too-many-requests':
+          message = 'Too many attempts. Please try again later.';
+          break;
+
+        case 'network-request-failed':
+          message = 'Check your internet connection.';
+          break;
+
+        default:
+          message = e.message ?? 'Login failed. Please try again.';
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(message),
+          backgroundColor: Colors.red,
+        ),
+      );
+    } on FirebaseException catch (e) {
+      if (!mounted) return;
 
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            'Login failed: ${e.toString()}',
+            'Database error: ${e.message ?? e.code}',
           ),
           backgroundColor: Colors.red,
-          duration: const Duration(seconds: 4),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            e.toString().replaceFirst('Exception: ', ''),
+          ),
+          backgroundColor: Colors.red,
         ),
       );
     } finally {
       if (mounted) {
-        setState(() {
-          isLoading = false;
-        });
+        setState(() => isLoading = false);
       }
     }
   }
 
-  // ============================================================
-  // BUILD
-  // ============================================================
+  Future<void> resetPassword() async {
+    final email = emailController.text.trim().toLowerCase();
+
+    if (email.isEmpty ||
+        !RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(email)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Enter your email address first.'),
+        ),
+      );
+      return;
+    }
+
+    try {
+      await FirebaseAuth.instance.sendPasswordResetEmail(
+        email: email,
+      );
+
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Password reset email sent. Check your inbox.',
+          ),
+          backgroundColor: Colors.green,
+        ),
+      );
+    } on FirebaseAuthException catch (e) {
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            e.message ?? 'Could not send reset email.',
+          ),
+          backgroundColor: Colors.red,
+        ),
+      );
+    }
+  }
+
+  InputDecoration decoration(String label, IconData icon) {
+    return InputDecoration(
+      labelText: label,
+      prefixIcon: Icon(icon),
+      border: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(12),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFFF4F7FB),
-
-      appBar: AppBar(
-        title: const Text(
-          'Login',
-          style: TextStyle(
-            fontWeight: FontWeight.bold,
-          ),
-        ),
-        centerTitle: true,
-        backgroundColor: Colors.teal,
-        foregroundColor: Colors.white,
-      ),
-
       body: SafeArea(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.all(24),
-
-          child: Form(
-            key: _formKey,
-
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-
-              children: [
-
-                // ==================================================
-                // ICON
-                // ==================================================
-
-                const SizedBox(height: 25),
-
-                Center(
-                  child: Container(
-                    width: 90,
-                    height: 90,
-
-                    decoration: BoxDecoration(
-                      color: Colors.teal,
-                      borderRadius: BorderRadius.circular(45),
-                    ),
-
-                    child: const Icon(
-                      Icons.health_and_safety,
-                      size: 50,
-                      color: Colors.white,
-                    ),
-                  ),
-                ),
-
-                const SizedBox(height: 20),
-
-                const Text(
-                  'ASHA Connect',
-                  textAlign: TextAlign.center,
-
-                  style: TextStyle(
-                    fontSize: 28,
-                    fontWeight: FontWeight.bold,
+        child: Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(24),
+            child: Form(
+              key: _formKey,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  const Icon(
+                    Icons.health_and_safety,
+                    size: 80,
                     color: Colors.teal,
                   ),
-                ),
+                  const SizedBox(height: 12),
 
-                const SizedBox(height: 8),
-
-                const Text(
-                  'Login to your account',
-                  textAlign: TextAlign.center,
-
-                  style: TextStyle(
-                    fontSize: 15,
-                    color: Colors.grey,
+                  const Text(
+                    'AshaSarthi',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontSize: 30,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.teal,
+                    ),
                   ),
-                ),
+                  const SizedBox(height: 8),
 
-                const SizedBox(height: 35),
-
-                // ==================================================
-                // ROLE
-                // ==================================================
-
-                const Text(
-                  'Select Role',
-                  style: TextStyle(
-                    fontSize: 15,
-                    fontWeight: FontWeight.bold,
+                  const Text(
+                    'Login to your account',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(fontSize: 16),
                   ),
-                ),
+                  const SizedBox(height: 32),
 
-                const SizedBox(height: 8),
-
-                DropdownButtonFormField<String>(
-                  value: selectedRole,
-
-                  decoration: InputDecoration(
-                    prefixIcon: const Icon(
-                      Icons.person_outline,
+                  TextFormField(
+                    controller: emailController,
+                    keyboardType: TextInputType.emailAddress,
+                    autocorrect: false,
+                    decoration: decoration(
+                      'Email Address',
+                      Icons.email,
                     ),
+                    validator: (value) {
+                      final email = value?.trim() ?? '';
 
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(12),
-                    ),
+                      if (email.isEmpty) {
+                        return 'Please enter your email';
+                      }
 
-                    filled: true,
-                    fillColor: Colors.white,
+                      if (!RegExp(
+                        r'^[^@\s]+@[^@\s]+\.[^@\s]+$',
+                      ).hasMatch(email)) {
+                        return 'Enter a valid email address';
+                      }
+
+                      return null;
+                    },
                   ),
+                  const SizedBox(height: 18),
 
-                  items: const [
-                    DropdownMenuItem(
-                      value: 'asha_worker',
-                      child: Text('ASHA Worker'),
-                    ),
-
-                    DropdownMenuItem(
-                      value: 'supervisor',
-                      child: Text('Supervisor'),
-                    ),
-
-                    DropdownMenuItem(
-                      value: 'beneficiary',
-                      child: Text('Beneficiary'),
-                    ),
-                  ],
-
-                  onChanged: isLoading
-                      ? null
-                      : (value) {
-                          if (value != null) {
-                            setState(() {
-                              selectedRole = value;
-                            });
-                          }
+                  TextFormField(
+                    controller: passwordController,
+                    obscureText: obscurePassword,
+                    decoration: decoration(
+                      'Password',
+                      Icons.lock,
+                    ).copyWith(
+                      suffixIcon: IconButton(
+                        icon: Icon(
+                          obscurePassword
+                              ? Icons.visibility_off
+                              : Icons.visibility,
+                        ),
+                        onPressed: () {
+                          setState(() {
+                            obscurePassword = !obscurePassword;
+                          });
                         },
-                ),
-
-                const SizedBox(height: 20),
-
-                // ==================================================
-                // EMAIL
-                // ==================================================
-
-                const Text(
-                  'Email',
-                  style: TextStyle(
-                    fontSize: 15,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-
-                const SizedBox(height: 8),
-
-                TextFormField(
-                  controller: emailController,
-                  keyboardType: TextInputType.emailAddress,
-                  decoration: InputDecoration(
-                    hintText: 'Enter email address',
-                    prefixIcon: const Icon(Icons.email_outlined),
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    filled: true,
-                    fillColor: Colors.white,
-                  ),
-                  validator: (value) {
-                    final email = value?.trim() ?? '';
-                    if (email.isEmpty) {
-                      return 'Please enter email';
-                    }
-                    if (!email.contains('@') || !email.contains('.')) {
-                      return 'Enter a valid email address';
-                    }
-                    return null;
-                  },
-                ),
-                const SizedBox(height: 20),
-
-                // ==================================================
-                // PASSWORD
-                // ==================================================
-
-                const Text(
-                  'Password',
-                  style: TextStyle(
-                    fontSize: 15,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-
-                const SizedBox(height: 8),
-
-                TextFormField(
-                  controller: passwordController,
-
-                  obscureText: obscurePassword,
-
-                  decoration: InputDecoration(
-                    hintText: 'Enter password',
-
-                    prefixIcon: const Icon(
-                      Icons.lock_outline,
-                    ),
-
-                    suffixIcon: IconButton(
-                      icon: Icon(
-                        obscurePassword
-                            ? Icons.visibility_off
-                            : Icons.visibility,
-                      ),
-
-                      onPressed: () {
-                        setState(() {
-                          obscurePassword = !obscurePassword;
-                        });
-                      },
-                    ),
-
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-
-                    filled: true,
-                    fillColor: Colors.white,
-                  ),
-
-                  validator: (value) {
-                    if (value == null || value.isEmpty) {
-                      return 'Please enter password';
-                    }
-
-                    if (value.length < 4) {
-                      return 'Password is too short';
-                    }
-
-                    return null;
-                  },
-                ),
-
-                const SizedBox(height: 30),
-
-                // ==================================================
-                // LOGIN BUTTON
-                // ==================================================
-
-                SizedBox(
-                  height: 52,
-
-                  child: ElevatedButton(
-                    onPressed: isLoading ? null : login,
-
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: Colors.teal,
-                      foregroundColor: Colors.white,
-
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(12),
                       ),
                     ),
-
-                    child: isLoading
-                        ? const SizedBox(
-                            width: 25,
-                            height: 25,
-
-                            child: CircularProgressIndicator(
-                              strokeWidth: 3,
-                              color: Colors.white,
-                            ),
-                          )
-                        : const Text(
-                            'LOGIN',
-                            style: TextStyle(
-                              fontSize: 17,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
+                    validator: (value) {
+                      if (value == null || value.isEmpty) {
+                        return 'Please enter your password';
+                      }
+                      return null;
+                    },
                   ),
-                ),
 
-                const SizedBox(height: 20),
-
-                // ==================================================
-                // REGISTER
-                // ==================================================
-
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-
-                  children: [
-                    const Text(
-                      "Don't have an account? ",
-                      style: TextStyle(
-                        color: Colors.grey,
-                      ),
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: TextButton(
+                      onPressed: isLoading ? null : resetPassword,
+                      child: const Text('Forgot Password?'),
                     ),
+                  ),
+                  const SizedBox(height: 12),
 
-                    TextButton(
-                      onPressed: isLoading
-                          ? null
-                          : () {
-                              Navigator.pushNamed(
-                                context,
-                                '/register',
-                              );
-                            },
-
-                      child: const Text(
-                        'Register',
-                        style: TextStyle(
-                          fontWeight: FontWeight.bold,
-                          color: Colors.teal,
+                  SizedBox(
+                    height: 52,
+                    child: ElevatedButton(
+                      onPressed: isLoading ? null : loginAccount,
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.teal,
+                        foregroundColor: Colors.white,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
                         ),
                       ),
+                      child: isLoading
+                          ? const SizedBox(
+                              height: 24,
+                              width: 24,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Colors.white,
+                              ),
+                            )
+                          : const Text(
+                              'Login',
+                              style: TextStyle(
+                                fontSize: 16,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
                     ),
-                  ],
-                ),
+                  ),
+                  const SizedBox(height: 16),
 
-                const SizedBox(height: 20),
-              ],
+                  TextButton(
+                    onPressed: isLoading
+                        ? null
+                        : () {
+                            Navigator.push(
+                              context,
+                              MaterialPageRoute(
+                                builder: (_) => const RegisterScreen(),
+                              ),
+                            );
+                          },
+                    child: const Text(
+                      "Don't have an account? Create Account",
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
         ),
